@@ -1,0 +1,11 @@
+cpython-3.8.20.zip
+cpython-3.8.zip
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+__pycache__/
+.venv/
+env/
+venv/

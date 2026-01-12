@@ -1,7 +1,11 @@
 import argparse
 import sys
 import os
-import numpy as np
+import numpy as _np
+for _alias, _target in (("long", "int_"), ("int", "int_"), ("float", "float_")):
+    if not hasattr(_np, _alias):
+        setattr(_np, _alias, getattr(_np, _target))
+        
 import librosa
 import yaml
 import random
@@ -18,7 +22,9 @@ import warnings
 warnings.filterwarnings("ignore")
 
 SAMPLE_RATE = 24000
+from torch.cuda.amp import autocast, GradScaler
 
+scaler = GradScaler()
 class Dataset_LibriSeVoc(Dataset):
     
     def __init__(self, dataset_path, split = 'train'):
@@ -140,7 +146,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', type=str, default='/your/path/to/LibriSeVoc/')
     parser.add_argument('--model_save_path', type=str, default='/your/path/to/models')
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--weight_decay', type=float, default=0.0001)
@@ -157,11 +163,11 @@ if __name__ == '__main__':
     # load dataset
     train_set = Dataset_LibriSeVoc(split = 'train', dataset_path = data_path)
 
-    train_dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True, drop_last=False)
+    train_dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True, drop_last=False, num_workers=2, pin_memory=True)
 
     dev_set = Dataset_LibriSeVoc(split = 'dev', dataset_path = data_path)
 
-    dev_dataloader = DataLoader(dev_set, batch_size=batch_size, shuffle=True, drop_last=False)
+    dev_dataloader = DataLoader(dev_set, batch_size=batch_size, shuffle=True, drop_last=False, num_workers=2, pin_memory=True)
 
     # load model config
     dir_yaml = os.path.splitext('model_config_RawNet')[0] + '.yaml'
@@ -169,7 +175,8 @@ if __name__ == '__main__':
         parser1 = yaml.safe_load(f_yaml)
 
     # load cuda
-    device = 'cuda:1' if torch.cuda.is_available() else 'cpu'
+    # device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    device = 'cpu'
     print('Device: {}'.format(device))
 
     # init model
@@ -217,41 +224,43 @@ if __name__ == '__main__':
         criterion_binary = nn.CrossEntropyLoss()
         criterion_multi = nn.CrossEntropyLoss()
         
-        for batch_x, batch_y_multi, batch_y_binary in tqdm(train_loader,total=len(train_loader)):
-            #print(batch_x.shape, batch_y_binary.shape, batch_y_multi.shape)
+        for batch_x, batch_y_multi, batch_y_binary in tqdm(train_loader, total=len(train_loader)):
             batch_size = batch_x.size(0)
             num_total += batch_size
             ii += 1
-            
-            batch_x = batch_x.to(device)
-            batch_y_binary = batch_y_binary.view(-1).type(torch.int64).to(device)
-            batch_y_multi = batch_y_multi.view(-1).type(torch.int64).to(device)
-            
-            batch_out_binary, batch_out_multi = model(batch_x)
-            #print(batch_out_binary, batch_out_multi)
-            #print(batch_y_binary, batch_y_multi)
-            
-            batch_loss = lamda * criterion_binary(batch_out_binary, batch_y_binary) + (1- lamda) * criterion_multi(batch_out_multi, batch_y_multi)
-            
-            #print(batch_loss)
-            
-            # binary acc
+
+            # move to device
+            batch_x = batch_x.to(device, non_blocking=True)
+            batch_y_binary = batch_y_binary.view(-1).type(torch.int64).to(device, non_blocking=True)
+            batch_y_multi = batch_y_multi.view(-1).type(torch.int64).to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+
+            # FP16 mixed precision forward/backward
+            with autocast():
+                batch_out_binary, batch_out_multi = model(batch_x)
+                batch_loss = lamda * criterion_binary(batch_out_binary, batch_y_binary) + \
+                             (1 - lamda) * criterion_multi(batch_out_multi, batch_y_multi)
+
+            # scale gradients
+            scaler.scale(batch_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # binary accuracy
             _, batch_pred_binary = batch_out_binary.max(dim=1)
-            num_correct_binary += (batch_pred_binary == batch_y_binary).sum(dim=0).item()
-            
-            #multi acc
+            num_correct_binary += (batch_pred_binary == batch_y_binary).sum().item()
+
+            # multi-class accuracy
             _, batch_pred_multi = batch_out_multi.max(dim=1)
-            num_correct_multi += (batch_pred_multi == batch_y_multi).sum(dim=0).item()
-            
+            num_correct_multi += (batch_pred_multi == batch_y_multi).sum().item()
+
             if ii % 10 == 0:
                 out_write = 'training multi accuracy: {:.2f}, training binary accuracy: {:.2f}'.format(
-                    (num_correct_multi/num_total)*100, (num_correct_binary/num_total)*100)
-                
-            running_loss += (batch_loss.item() * batch_size)
-            
-            optim.zero_grad()
-            batch_loss.backward()
-            optim.step()
+                    (num_correct_multi / num_total) * 100, (num_correct_binary / num_total) * 100
+                )
+
+            running_loss += batch_loss.item() * batch_size
         
         running_loss /= num_total
         train_accuracy = ((num_correct_binary+num_correct_multi)/num_total)*50
